@@ -17,7 +17,6 @@ type RequireAtLeastOne<T, Keys extends keyof T = keyof T> = Pick<T, Exclude<keyo
         [K in Keys]-?: Required<Pick<T, K>> & Partial<Pick<T, Exclude<Keys, K>>>;
     }[Keys];
 
-
 export type MatchParams = Record<string, string> | null;
 
 export interface RouterLocation {
@@ -25,22 +24,47 @@ export interface RouterLocation {
     search: string;
 }
 
+export type LocationChanger = (params: LocationSetterParams) => void;
+
+export type Guards = ArrayGuards;
+type ArrayGuards = Guard[];
+type ObjectGuards = Record<string, Guard>;
+export type Guard = (params: GuardParams) => Promise<any>;
+export interface GuardParams {
+    route: Route;
+    redirect: LocationChanger;
+    location: RouterLocation;
+}
+
+export type Resolvers = ArrayResolvers;
+type ArrayResolvers = ObjectResolvers[];
+type ObjectResolvers = Record<string, any>;
+export type Resolver = (params: ResolverParams) => Promise<any>;
+export interface ResolverParams {
+    route: Route;
+    redirect: LocationChanger;
+    location: RouterLocation;
+}
+
+type ComponentOrChildren = RequireAtLeastOne<{
+    component: React.ComponentType<any>;
+    children: Routes;
+}>;
 export type Routes = Route[];
-export type Route = RequireAtLeastOne<
-    {
-        match: string;
-        component: React.ComponentType<any>;
-        children: Routes;
-    },
-    'component' | 'children'
->;
+export type Route = {
+    match: string;
+    resolvers?: Resolvers;
+    guards?: Guards;
+} & ComponentOrChildren;
 
 type FlatRoutes = FlatRoute[];
-type FlatRoute = Required<Omit<Route, 'children'>> & {
+type FlatRoute = {
+    match: string;
+    component: React.ComponentType<any>;
     hierarchy: Route[];
 };
 
-type RouterLocationStateSetter = (stateBuilder: (state: RouterLocation) => RouterLocation) => void
+type RouterLocationStateSetter = (stateBuilder: (state: RouterLocation) => RouterLocation) => void;
 
 interface RouterState {
     routes: Routes;
@@ -54,7 +78,10 @@ interface LocationSetterParams {
     search?: Record<string, any> | string;
 }
 
-const RouterContext = createContext<[RouterState | null, RouterLocationStateSetter | null]>([null, null]);
+const RouterContext = createContext<[RouterState | null, RouterLocationStateSetter | null]>([
+    null,
+    null,
+]);
 
 const mergePaths = (left: string, right: string) => {
     const leftSlash = left.charAt(left.length - 1) === '/';
@@ -92,6 +119,13 @@ const match = (
     return { route: null, params: null };
 };
 
+const needsPreloading = (route: Route): boolean => {
+    const hasGuards = route.guards && route.guards.length > 0;
+    const hasResolvers = route.resolvers && route.resolvers.length > 0;
+
+    return Boolean(hasGuards || hasResolvers);
+}
+
 const flatten = (routes: Routes): FlatRoutes => {
     const flatRoutes: FlatRoutes = [];
 
@@ -105,13 +139,17 @@ const flatten = (routes: Routes): FlatRoutes => {
                 const Component = flatRoute.component;
                 const ChildComponent = child.component;
 
-                const NewComponent = Component
-                    ? () => (
-                          <Component>
+                let NewComponent: React.ComponentType<any> = Component
+                    ? (props: any) => (
+                          <Component {...props}>
                               <ChildComponent />
                           </Component>
                       )
                     : () => <ChildComponent />;
+
+                if (needsPreloading(route)){
+                    NewComponent = withRoutePreloader({ route, component: NewComponent })
+                }
 
                 flatRoutes.push({
                     match: mergePaths(flatRoute.match, child.match),
@@ -120,7 +158,11 @@ const flatten = (routes: Routes): FlatRoutes => {
                 });
             }
         } else if (route.component) {
-            flatRoutes.push(flatRoute as FlatRoute);
+            if (needsPreloading(route)){
+                flatRoutes.push({ ...flatRoute, component: withRoutePreloader({ route, component: route.component }) })
+            } else {
+                flatRoutes.push(flatRoute as FlatRoute);
+            }
         } else {
             console.error('Found route with no component or children properties. Ignoring');
         }
@@ -163,6 +205,21 @@ const getRouterLocationFromLocation = (location: Location) => ({
     search: location.search,
 });
 
+const buildSearchString = (search: string | Record<string, any>) => {
+    let newSearch;
+    if (typeof search === 'string') {
+        if (search.charAt(0) === '?') {
+            newSearch = search;
+        } else {
+            newSearch = '?' + search;
+        }
+    } else {
+        newSearch = '?' + stringify(search);
+    }
+
+    return newSearch;
+};
+
 const useRouterState = () => {
     const [routerState, setRouterLocationState] = useContext(RouterContext);
 
@@ -175,39 +232,29 @@ const useRouterState = () => {
     return [routerState, setRouterLocationState] as [RouterState, RouterLocationStateSetter];
 };
 
-export const useLocation = (): [RouterLocation, (params: LocationSetterParams) => void] => {
+export const useLocation = (): [RouterLocation, LocationChanger] => {
     const [routerState, setRouterLocationState] = useRouterState();
 
-    const locationSetter = useCallback(
-        ({ pathname, search }: LocationSetterParams) => {
-            const newState: Partial<RouterLocation> = {};
+    const locationSetter = useCallback(({ pathname, search }: LocationSetterParams) => {
+        const newState: Partial<RouterLocation> = {};
 
-            if (typeof search === 'string') {
-                if (search.charAt(0) === '?') {
-                    newState.search = search;
-                } else {
-                    newState.search = '?' + search;
-                }
-            } else if (search) {
-                newState.search = '?' + stringify(search);
-            }
+        if (search) {
+            newState.search = buildSearchString(search);
+        }
 
-            if (pathname) {
-                newState.pathname = pathname;
-            }
+        if (pathname) {
+            newState.pathname = pathname;
+        }
 
-            setRouterLocationState((oldState) => {
-                const newLocationState = { ...oldState, ...newState };
-                return newLocationState;
-            });
-        },
-        []
-    );
+        setRouterLocationState((oldState) => {
+            const newLocationState = { ...oldState, ...newState };
+            return newLocationState;
+        });
+    }, []);
 
     console.log('Location', routerState.location);
     return [routerState.location, locationSetter];
 };
-
 
 const useCurrentFlatRoute = () => {
     const [routerState] = useRouterState();
@@ -227,49 +274,57 @@ export const useCurrentRoute = () => {
     return { route: flatRoute.hierarchy[flatRoute.hierarchy.length - 1], params };
 };
 
-
-
 export const Router = memo(({ routes: nonStaticRoutes }: { routes: Routes }) => {
-
     // Make routes static
-    const routes = useMemo(() => nonStaticRoutes, [])
+    const routes = useMemo(() => nonStaticRoutes, []);
 
     const [routerState, setRouterState] = useState<RouterState>(() =>
         routerStateFromLocation(routes, getRouterLocationFromLocation(location))
     );
 
-    const setRouterLocationState = useCallback((stateBuilder: (state: RouterLocation) => RouterLocation) => {
-        setRouterState(oldState => {
-            const newLocationState = stateBuilder(oldState.location)
-            return routerStateFromLocation(routes, newLocationState);
-        })
-    }, [setRouterState, routes])
+    const setRouterLocationState = useCallback(
+        (stateBuilder: (state: RouterLocation) => RouterLocation) => {
+            setRouterState((oldState) => {
+                const newLocationState = stateBuilder(oldState.location);
+                return routerStateFromLocation(routes, newLocationState);
+            });
+        },
+        [setRouterState, routes]
+    );
 
     console.log('Router State:', routerState);
 
     useEffect(() => {
-        if(location.pathname === routerState.location.pathname && location.search === routerState.location.search){
+        if (
+            location.pathname === routerState.location.pathname &&
+            location.search === routerState.location.search
+        ) {
             return;
         }
 
-        window.history.pushState(null, '', routerState.location.pathname + routerState.location.search);
-    }, [routerState.location])
-
+        window.history.pushState(
+            null,
+            '',
+            routerState.location.pathname + routerState.location.search
+        );
+    }, [routerState.location]);
 
     const popStateListener = useCallback(() => {
-            setRouterState(routerStateFromLocation(routes, location));
-        }, [routes, setRouterState])
+        setRouterState(routerStateFromLocation(routes, location));
+    }, [routes, setRouterState]);
 
-    const previousPopstateListener = useRef(popStateListener)
+    const previousPopstateListener = useRef(popStateListener);
 
     useEffect(() => {
         // Skip remove on initial render
-        if(previousPopstateListener.current !== popStateListener){
-            window.removeEventListener('popstate', previousPopstateListener.current)
+        if (previousPopstateListener.current !== popStateListener) {
+            window.removeEventListener('popstate', previousPopstateListener.current);
         }
         window.addEventListener('popstate', popStateListener);
         previousPopstateListener.current = popStateListener;
-    }, [popStateListener])
+    }, [popStateListener]);
+
+
 
 
     return (
@@ -293,4 +348,66 @@ const RouterConsumer = memo(() => {
     return <route.component />;
 });
 
+export type PreloadingRoute = Route & {
+    preloadingState: { loading: boolean, resolvedData: Record<string, any> };
+}
 
+const withRoutePreloader = ({ route, component, ...rest }: { route: Route, component: React.ComponentType<any> }) => memo(() => {
+    const [preloadingState, setPreloadingState] = useState(() => ({ loading: needsPreloading(route), resolvedData: {} }));
+    const [locationState, setLocationState] = useLocation();
+
+    const Component = component;
+
+    const preloadingRoute: PreloadingRoute = useMemo(() => ({
+        ...route,
+        preloadingState
+    }), [preloadingState])
+
+    useEffect(() => {
+        const guardPromise = (route.guards || []).reduce((prom, guard) => {
+            return prom.then(() => guard({ route, redirect: setLocationState, location: locationState }))
+        }, Promise.resolve())
+
+        const resolvePromise = (route.resolvers || []).reduce((prom, resolverObject) => {
+            const resolvedData: Record<string, any> = {}
+            const resolvePromises = Object.entries(resolverObject).map(([key, resolver]) => {
+                return resolver({ route, redirect: setLocationState, location: locationState }).then((result: any) => resolvedData[key] = result)
+            })
+
+            return Promise.all(resolvePromises).then(() => resolvedData)
+        }, Promise.resolve())
+
+        const preloadPromise = guardPromise.then(() => resolvePromise);
+
+        preloadPromise.then(resolvedData => setPreloadingState({ loading: false, resolvedData }))
+
+        // TODO return function to cancel promise chain
+
+    }, [])
+
+    return <Component route={preloadingRoute} {...rest} />;
+})
+
+export const Link = ({ to, onClick, children = null, ...rest }: { to: string, children: React.ReactNode, onClick?: (event: any) => void }) => {
+    const [_, setLocation] = useLocation();
+
+    const handleClick = useCallback((event) => {
+      if (event.ctrlKey || event.metaKey || event.altKey || event.shiftKey || event.button !== 0){
+        return;
+      }
+
+      event.preventDefault();
+
+      setLocation({ pathname: to })
+
+      if (onClick) {
+        onClick(event)
+      }
+    },
+    [onClick, setLocation]
+  );
+
+  return <a href={to} onClick={handleClick} {...rest}>{children}</a>
+}
+
+// TODO: Routes rerunning all guards/resovlers on leaf change
