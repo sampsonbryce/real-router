@@ -14,6 +14,7 @@ module.exports = {
         sourceType: 'module',
     },
     plugins: ['react', '@typescript-eslint', 'prettier', 'jest'],
+    ignorePatterns: ['.eslintrc.js'],
     rules: {
         'prettier/prettier': 'error',
         'react/jsx-filename-extension': [2, { extensions: ['.js', '.jsx', '.ts', '.tsx'] }],
@@ -35,6 +36,7 @@ module.exports = {
         '@typescript-eslint/no-use-before-define': 'off',
         'no-restricted-syntax': ['error', 'LabeledStatement', 'WithStatement'],
         'no-param-reassign': ['error', { props: true, ignorePropertyModificationsFor: ['draft'] }],
+        'no-restricted-globals': 'off',
     },
     settings: {
         'import/resolver': {

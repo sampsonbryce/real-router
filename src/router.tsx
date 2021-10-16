@@ -60,7 +60,7 @@ export type Route = {
 type FlatRoutes = FlatRoute[];
 type FlatRoute = {
     match: string;
-    component: React.ComponentType<any>;
+    // component: React.ComponentType<any>;
     hierarchy: Route[];
 };
 
@@ -88,11 +88,12 @@ const mergePaths = (left: string, right: string) => {
     const rightSlash = right.charAt(0) === '/';
     if (leftSlash && rightSlash) {
         return left + right.substring(1);
-    } else if ((leftSlash && !rightSlash) || (!leftSlash && rightSlash)) {
+    }
+    if ((leftSlash && !rightSlash) || (!leftSlash && rightSlash)) {
         return left + right;
     }
 
-    return left + '/' + right;
+    return `${left}/${right}`;
 };
 
 const match = (
@@ -100,7 +101,7 @@ const match = (
     routes: FlatRoutes
 ): { route: FlatRoute | null; params: MatchParams | null } => {
     for (const route of routes) {
-        const match = route.match;
+        const { match } = route;
 
         if (typeof match === 'string') {
             if (match === '*') {
@@ -124,7 +125,7 @@ const needsPreloading = (route: Route): boolean => {
     const hasResolvers = route.resolvers && route.resolvers.length > 0;
 
     return Boolean(hasGuards || hasResolvers);
-}
+};
 
 const flatten = (routes: Routes): FlatRoutes => {
     const flatRoutes: FlatRoutes = [];
@@ -136,33 +137,33 @@ const flatten = (routes: Routes): FlatRoutes => {
             const children = flatten(route.children);
 
             for (const child of children) {
-                const Component = flatRoute.component;
-                const ChildComponent = child.component;
+                // const Component = flatRoute.component;
+                // const ChildComponent = child.component;
 
-                let NewComponent: React.ComponentType<any> = Component
-                    ? (props: any) => (
-                          <Component {...props}>
-                              <ChildComponent />
-                          </Component>
-                      )
-                    : () => <ChildComponent />;
+                // let NewComponent: React.ComponentType<any> = Component
+                //     ? (props: any) => (
+                //           <Component {...props}>
+                //               <ChildComponent />
+                //           </Component>
+                //       )
+                //     : () => <ChildComponent />;
 
-                if (needsPreloading(route)){
-                    NewComponent = withRoutePreloader({ route, component: NewComponent })
-                }
+                // if (needsPreloading(route)){
+                //     NewComponent = withRoutePreloader({ route, component: NewComponent })
+                // }
 
                 flatRoutes.push({
                     match: mergePaths(flatRoute.match, child.match),
-                    component: NewComponent,
+                    // component: NewComponent,
                     hierarchy: [...flatRoute.hierarchy, ...child.hierarchy],
                 });
             }
         } else if (route.component) {
-            if (needsPreloading(route)){
-                flatRoutes.push({ ...flatRoute, component: withRoutePreloader({ route, component: route.component }) })
-            } else {
-                flatRoutes.push(flatRoute as FlatRoute);
-            }
+            // if (needsPreloading(route)){
+            //     flatRoutes.push({ ...flatRoute, component: withRoutePreloader({ route, component: route.component }) })
+            // } else {
+            flatRoutes.push(flatRoute as FlatRoute);
+            // }
         } else {
             console.error('Found route with no component or children properties. Ignoring');
         }
@@ -211,10 +212,10 @@ const buildSearchString = (search: string | Record<string, any>) => {
         if (search.charAt(0) === '?') {
             newSearch = search;
         } else {
-            newSearch = '?' + search;
+            newSearch = `?${search}`;
         }
     } else {
-        newSearch = '?' + stringify(search);
+        newSearch = `?${stringify(search)}`;
     }
 
     return newSearch;
@@ -324,9 +325,6 @@ export const Router = memo(({ routes: nonStaticRoutes }: { routes: Routes }) => 
         previousPopstateListener.current = popStateListener;
     }, [popStateListener]);
 
-
-
-
     return (
         <RouterContext.Provider value={[routerState, setRouterLocationState]}>
             <RouterConsumer />
@@ -349,65 +347,106 @@ const RouterConsumer = memo(() => {
 });
 
 export type PreloadingRoute = Route & {
-    preloadingState: { loading: boolean, resolvedData: Record<string, any> };
-}
+    preloadingState: { loading: boolean; resolvedData: Record<string, any> };
+};
 
-const withRoutePreloader = ({ route, component, ...rest }: { route: Route, component: React.ComponentType<any> }) => memo(() => {
-    const [preloadingState, setPreloadingState] = useState(() => ({ loading: needsPreloading(route), resolvedData: {} }));
-    const [locationState, setLocationState] = useLocation();
+const withRoutePreloader = ({
+    route,
+    component,
+    ...rest
+}: {
+    route: Route;
+    component: React.ComponentType<any>;
+}) =>
+    memo(() => {
+        const [preloadingState, setPreloadingState] = useState(() => ({
+            loading: needsPreloading(route),
+            resolvedData: {},
+        }));
+        const [locationState, setLocationState] = useLocation();
 
-    const Component = component;
+        const Component = component;
 
-    const preloadingRoute: PreloadingRoute = useMemo(() => ({
-        ...route,
-        preloadingState
-    }), [preloadingState])
+        const preloadingRoute: PreloadingRoute = useMemo(
+            () => ({
+                ...route,
+                preloadingState,
+            }),
+            [preloadingState]
+        );
 
-    useEffect(() => {
-        const guardPromise = (route.guards || []).reduce((prom, guard) => {
-            return prom.then(() => guard({ route, redirect: setLocationState, location: locationState }))
-        }, Promise.resolve())
+        useEffect(() => {
+            const guardPromise = (route.guards || []).reduce(
+                (prom, guard) =>
+                    prom.then(() =>
+                        guard({ route, redirect: setLocationState, location: locationState })
+                    ),
+                Promise.resolve()
+            );
 
-        const resolvePromise = (route.resolvers || []).reduce((prom, resolverObject) => {
-            const resolvedData: Record<string, any> = {}
-            const resolvePromises = Object.entries(resolverObject).map(([key, resolver]) => {
-                return resolver({ route, redirect: setLocationState, location: locationState }).then((result: any) => resolvedData[key] = result)
-            })
+            const resolvePromise = (route.resolvers || []).reduce((prom, resolverObject) => {
+                const resolvedData: Record<string, any> = {};
+                const resolvePromises = Object.entries(resolverObject).map(([key, resolver]) =>
+                    resolver({ route, redirect: setLocationState, location: locationState }).then(
+                        (result: any) => (resolvedData[key] = result)
+                    )
+                );
 
-            return Promise.all(resolvePromises).then(() => resolvedData)
-        }, Promise.resolve())
+                return Promise.all(resolvePromises).then(() => resolvedData);
+            }, Promise.resolve());
 
-        const preloadPromise = guardPromise.then(() => resolvePromise);
+            const preloadPromise = guardPromise.then(() => resolvePromise);
 
-        preloadPromise.then(resolvedData => setPreloadingState({ loading: false, resolvedData }))
+            preloadPromise.then((resolvedData) =>
+                setPreloadingState({ loading: false, resolvedData })
+            );
 
-        // TODO return function to cancel promise chain
+            // TODO return function to cancel promise chain
+        }, []);
 
-    }, [])
+        return <Component route={preloadingRoute} {...rest} />;
+    });
 
-    return <Component route={preloadingRoute} {...rest} />;
-})
-
-export const Link = ({ to, onClick, children = null, ...rest }: { to: string, children: React.ReactNode, onClick?: (event: any) => void }) => {
+export const Link = ({
+    to,
+    onClick,
+    children = null,
+    ...rest
+}: {
+    to: string;
+    children: React.ReactNode;
+    onClick?: (event: any) => void;
+}) => {
     const [_, setLocation] = useLocation();
 
-    const handleClick = useCallback((event) => {
-      if (event.ctrlKey || event.metaKey || event.altKey || event.shiftKey || event.button !== 0){
-        return;
-      }
+    const handleClick = useCallback(
+        (event) => {
+            if (
+                event.ctrlKey ||
+                event.metaKey ||
+                event.altKey ||
+                event.shiftKey ||
+                event.button !== 0
+            ) {
+                return;
+            }
 
-      event.preventDefault();
+            event.preventDefault();
 
-      setLocation({ pathname: to })
+            setLocation({ pathname: to });
 
-      if (onClick) {
-        onClick(event)
-      }
-    },
-    [onClick, setLocation]
-  );
+            if (onClick) {
+                onClick(event);
+            }
+        },
+        [onClick, setLocation]
+    );
 
-  return <a href={to} onClick={handleClick} {...rest}>{children}</a>
-}
+    return (
+        <a href={to} onClick={handleClick} {...rest}>
+            {children}
+        </a>
+    );
+};
 
 // TODO: Routes rerunning all guards/resovlers on leaf change
