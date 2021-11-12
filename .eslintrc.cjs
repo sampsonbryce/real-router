@@ -31,12 +31,17 @@ module.exports = {
             },
         ],
         'no-unused-vars': 'off',
-        '@typescript-eslint/no-unused-vars': 'error',
+        '@typescript-eslint/no-unused-vars': [
+            'error',
+            { argsIgnorePattern: '^_$', varsIgnorePattern: '^_$' },
+        ],
         'no-use-before-define': 'off',
         '@typescript-eslint/no-use-before-define': 'off',
         'no-restricted-syntax': ['error', 'LabeledStatement', 'WithStatement'],
         'no-param-reassign': ['error', { props: true, ignorePropertyModificationsFor: ['draft'] }],
         'no-restricted-globals': 'off',
+        'react/jsx-props-no-spreading': 'off',
+        'react/require-default-props': 'off',
     },
     settings: {
         'import/resolver': {

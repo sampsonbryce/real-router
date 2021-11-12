@@ -10,6 +10,7 @@ import React, {
 } from 'react';
 import { pathToRegexp } from 'path-to-regexp';
 import { stringify } from 'query-string';
+import { nanoid } from 'nanoid';
 
 // From: https://stackoverflow.com/questions/40510611/typescript-interface-require-one-of-two-properties-to-exist
 type RequireAtLeastOne<T, Keys extends keyof T = keyof T> = Pick<T, Exclude<keyof T, Keys>> &
@@ -28,7 +29,6 @@ export type LocationChanger = (params: LocationSetterParams) => void;
 
 export type Guards = ArrayGuards;
 type ArrayGuards = Guard[];
-type ObjectGuards = Record<string, Guard>;
 export type Guard = (params: GuardParams) => Promise<any>;
 export interface GuardParams {
     route: Route;
@@ -57,6 +57,11 @@ export type Route = {
     guards?: Guards;
 } & ComponentOrChildren;
 
+type InternalRoute = {
+    id: string;
+    children?: InternalRoute[];
+} & Route;
+
 type FlatRoutes = FlatRoute[];
 type FlatRoute = {
     match: string;
@@ -67,16 +72,20 @@ type FlatRoute = {
 type RouterLocationStateSetter = (stateBuilder: (state: RouterLocation) => RouterLocation) => void;
 
 interface RouterState {
-    routes: Routes;
-    flatRoutes: FlatRoutes;
+    routes: InternalRoute[];
+    // flatRoutes: FlatRoutes;
     location: RouterLocation;
-    currentFlatRouteState: { route: FlatRoute | null; params: MatchParams | null };
+    currentMatch: { hierarchy: string[]; params: MatchParams | null };
+    hierarchyMap: HierarchyMap;
+    // currentFlatRouteState: { route: FlatRoute | null; params: MatchParams | null };
 }
 
 interface LocationSetterParams {
     pathname?: string;
     search?: Record<string, any> | string;
 }
+
+type HierarchyMap = Record<string, string[]>;
 
 const RouterContext = createContext<[RouterState | null, RouterLocationStateSetter | null]>([
     null,
@@ -120,11 +129,50 @@ const match = (
     return { route: null, params: null };
 };
 
+const matchHierarchy = (
+    path: string,
+    hierarchyMap: HierarchyMap
+): { hierarchy: string[]; params: MatchParams | null } => {
+    for (const [matchPath, hierarchy] of Object.entries(hierarchyMap)) {
+        if (typeof matchPath === 'string') {
+            if (matchPath === '*') {
+                return { hierarchy, params: null };
+            }
+
+            const [regexMatch, params] = matchesRegex(path, matchPath);
+            if (regexMatch) {
+                return { hierarchy, params };
+            }
+        }
+    }
+
+    console.error('No route found');
+
+    return { hierarchy: [], params: null };
+};
+
 const needsPreloading = (route: Route): boolean => {
     const hasGuards = route.guards && route.guards.length > 0;
     const hasResolvers = route.resolvers && route.resolvers.length > 0;
 
     return Boolean(hasGuards || hasResolvers);
+};
+
+const buildHierarchyMap = (routes: InternalRoute[]): HierarchyMap => {
+    const map: HierarchyMap = {};
+    for (const route of routes) {
+        if (route.children) {
+            const childMap = buildHierarchyMap(route.children);
+
+            for (const [childMatch, childHierarchy] of Object.entries(childMap)) {
+                map[mergePaths(route.match, childMatch)] = [route.id, ...childHierarchy];
+            }
+        }
+
+        map[route.match] = [route.id];
+    }
+
+    return map;
 };
 
 const flatten = (routes: Routes): FlatRoutes => {
@@ -172,11 +220,11 @@ const flatten = (routes: Routes): FlatRoutes => {
     return flatRoutes;
 };
 
-const matchesRegex = (path: string, match: string): [boolean, MatchParams] => {
+const matchesRegex = (path: string, matchPath: string): [boolean, MatchParams] => {
     const keys: any[] = [];
 
     // TODO: cache
-    const regex = pathToRegexp(match, keys);
+    const regex = pathToRegexp(matchPath, keys);
     const regexResult = regex.exec(path);
 
     if (!regexResult) {
@@ -191,16 +239,21 @@ const matchesRegex = (path: string, match: string): [boolean, MatchParams] => {
     return [true, params];
 };
 
-const routerStateFromLocation = (routes: Routes, location: RouterLocation) => {
-    const flatRoutes = flatten(routes);
+const routerStateFromLocation = (
+    routes: InternalRoute[],
+    location: RouterLocation
+): RouterState => {
+    // const flatRoutes = flatten(routes);
+    const hierarchyMap = buildHierarchyMap(routes);
     return {
         routes,
         location,
-        flatRoutes,
-        currentFlatRouteState: match(location.pathname, flatRoutes),
+        currentMatch: matchHierarchy(location.pathname, hierarchyMap),
+        hierarchyMap,
+        // flatRoutes,
+        // currentFlatRouteState: match(location.pathname, flatRoutes),
     };
 };
-
 const getRouterLocationFromLocation = (location: Location) => ({
     pathname: location.pathname,
     search: location.search,
@@ -219,6 +272,11 @@ const buildSearchString = (search: string | Record<string, any>) => {
     }
 
     return newSearch;
+};
+
+const useComponentCache = (): Record<string, React.ComponentType<any>> => {
+    const cache = useRef({});
+    return cache.current;
 };
 
 const useRouterState = () => {
@@ -257,44 +315,72 @@ export const useLocation = (): [RouterLocation, LocationChanger] => {
     return [routerState.location, locationSetter];
 };
 
-const useCurrentFlatRoute = () => {
-    const [routerState] = useRouterState();
+// const useCurrentFlatRoute = () => {
+//     const [routerState] = useRouterState();
 
-    return routerState.currentFlatRouteState;
+//     return routerState.currentFlatRouteState;
+// };
+
+// export const useCurrentRoute = () => {
+//     const { route: flatRoute, params } = useCurrentFlatRoute();
+
+//     if (!flatRoute) {
+//         throw new Error(
+//             "Trying to access route when none has been found. Did you remember to have a '*' catch-all?"
+//         );
+//     }
+
+//     return { route: flatRoute.hierarchy[flatRoute.hierarchy.length - 1], params };
+// };
+
+const addIdsToRoutes = (routes: Route[]): InternalRoute[] => {
+    const newRoutes: InternalRoute[] = routes.map((route) => {
+        if (route.children) {
+            return {
+                ...route,
+                children: addIdsToRoutes(route.children),
+                id: nanoid(),
+            };
+        }
+
+        return {
+            ...(route as InternalRoute), // stupid ts
+            id: nanoid(),
+        };
+    });
+
+    return newRoutes;
 };
 
-export const useCurrentRoute = () => {
-    const { route: flatRoute, params } = useCurrentFlatRoute();
+const useCurrentMatch = () => {
+    const [routerState] = useRouterState();
 
-    if (!flatRoute) {
-        throw new Error(
-            "Trying to access route when none has been found. Did you remember to have a '*' catch-all?"
-        );
-    }
-
-    return { route: flatRoute.hierarchy[flatRoute.hierarchy.length - 1], params };
+    return routerState.currentMatch;
 };
 
 export const Router = memo(({ routes: nonStaticRoutes }: { routes: Routes }) => {
     // Make routes static
     const routes = useMemo(() => nonStaticRoutes, []);
 
+    const routesWithIds = useMemo(() => addIdsToRoutes(routes), [routes]);
+
     const [routerState, setRouterState] = useState<RouterState>(() =>
-        routerStateFromLocation(routes, getRouterLocationFromLocation(location))
+        routerStateFromLocation(routesWithIds, getRouterLocationFromLocation(location))
     );
 
     const setRouterLocationState = useCallback(
         (stateBuilder: (state: RouterLocation) => RouterLocation) => {
             setRouterState((oldState) => {
                 const newLocationState = stateBuilder(oldState.location);
-                return routerStateFromLocation(routes, newLocationState);
+                return routerStateFromLocation(routesWithIds, newLocationState);
             });
         },
-        [setRouterState, routes]
+        [setRouterState, routesWithIds]
     );
 
     console.log('Router State:', routerState);
 
+    // Sync location to url
     useEffect(() => {
         if (
             location.pathname === routerState.location.pathname &&
@@ -311,7 +397,7 @@ export const Router = memo(({ routes: nonStaticRoutes }: { routes: Routes }) => 
     }, [routerState.location]);
 
     const popStateListener = useCallback(() => {
-        setRouterState(routerStateFromLocation(routes, location));
+        setRouterState(routerStateFromLocation(routesWithIds, location));
     }, [routes, setRouterState]);
 
     const previousPopstateListener = useRef(popStateListener);
@@ -333,9 +419,10 @@ export const Router = memo(({ routes: nonStaticRoutes }: { routes: Routes }) => 
 });
 
 const RouterConsumer = memo(() => {
-    const { route } = useCurrentFlatRoute();
+    // const { route } = useCurrentFlatRoute();
+    const { hierarchy } = useCurrentMatch();
 
-    if (!route) {
+    if (!hierarchy.length) {
         console.error(
             "Trying to access route when none has been found. Did you remember to have a '*' catch-all?"
         );
@@ -343,29 +430,119 @@ const RouterConsumer = memo(() => {
         return null;
     }
 
-    return <route.component />;
+    return <RenderHierarchy />;
 });
+
+const getRouteListFromHierarchy = (
+    hierarchy: string[],
+    routes: InternalRoute[]
+): InternalRoute[] => {
+    let routeList: InternalRoute[] = [];
+    const currentHierarchy = [...hierarchy];
+    const id = currentHierarchy.shift();
+    console.log('RouteList from hierarchy', id, routes);
+
+    for (const route of routes) {
+        if (route.id === id) {
+            routeList.push(route);
+
+            if (route.children && currentHierarchy.length === 0) {
+                throw new Error(
+                    `Hierachy does not match routes object. Found route ${route.id} with children and no hierarchy`
+                );
+            } else if (!route.children && currentHierarchy.length > 0) {
+                throw new Error(
+                    `Hierachy does not match routes object. Found route ${route.id} with no children and hierarchy ${currentHierarchy}`
+                );
+            } else if (route.children) {
+                const childRoutes = getRouteListFromHierarchy(currentHierarchy, route.children);
+                routeList = routeList.concat(childRoutes);
+            }
+        }
+    }
+
+    return routeList;
+};
+
+const RenderHierarchy = () => {
+    const [routerState] = useRouterState();
+    const componentCache = useComponentCache();
+
+    const { routes } = routerState;
+    const { hierarchy } = routerState.currentMatch;
+
+    console.log('Hierarchy', hierarchy);
+    console.log('ComponentCache', componentCache);
+
+    const routeList = useMemo(
+        () => getRouteListFromHierarchy(hierarchy, routes),
+        [hierarchy, routes]
+    );
+
+    console.log('RouteList', routeList);
+
+    const components = useMemo(() => {
+        for (const id of Object.keys(componentCache)) {
+            if (!hierarchy.includes(id)) {
+                delete componentCache[id];
+            }
+        }
+
+        const componentsList = routeList.map((route) => {
+            if (route.id in componentCache) {
+                console.log('Using cached component for route', route.id);
+                return componentCache[route.id];
+            }
+
+            console.log('Using new component for route', route.id);
+            const component = withRoutePreloader(route);
+            component.displayName = route.id;
+            componentCache[route.id] = component;
+            return component;
+        });
+
+        componentsList.reverse();
+        return componentsList;
+    }, [routeList, componentCache, hierarchy]);
+
+    console.log('Components', components);
+
+    // const route = useMemo(() => hierarchy[0], [hierarchy]);
+    // const newHierarchy = useMemo(() => hierarchy.slice(1), [hierarchy]);
+
+    // const next = useMemo(() => {
+    //     if (newHierarchy.length > 0) {
+    //         return (props: any) => <RenderHierarchy hierarchy={newHierarchy} {...props} />;
+    //     }
+
+    //     return null;
+    // }, [newHierarchy]);
+
+    // console.log('RENDER HIERARCHY FOR ROUTE', route, hierarchy, newHierarchy);
+
+    // const Component = useMemo(() => withRoutePreloader({ route, next }), [route, next]);
+
+    // return <Component {...rest} />;
+
+    let componentToRender = null;
+    for (const Component of components) {
+        componentToRender = <Component>{componentToRender}</Component>;
+    }
+
+    return componentToRender;
+};
 
 export type PreloadingRoute = Route & {
     preloadingState: { loading: boolean; resolvedData: Record<string, any> };
 };
 
-const withRoutePreloader = ({
-    route,
-    component,
-    ...rest
-}: {
-    route: Route;
-    component: React.ComponentType<any>;
-}) =>
-    memo(() => {
+const withRoutePreloader = (route: InternalRoute) =>
+    memo(({ children }: { children: any }) => {
         const [preloadingState, setPreloadingState] = useState(() => ({
             loading: needsPreloading(route),
             resolvedData: {},
         }));
         const [locationState, setLocationState] = useLocation();
-
-        const Component = component;
 
         const preloadingRoute: PreloadingRoute = useMemo(
             () => ({
@@ -388,7 +565,9 @@ const withRoutePreloader = ({
                 const resolvedData: Record<string, any> = {};
                 const resolvePromises = Object.entries(resolverObject).map(([key, resolver]) =>
                     resolver({ route, redirect: setLocationState, location: locationState }).then(
-                        (result: any) => (resolvedData[key] = result)
+                        (result: any) => {
+                            resolvedData[key] = result;
+                        }
                     )
                 );
 
@@ -404,17 +583,45 @@ const withRoutePreloader = ({
             // TODO return function to cancel promise chain
         }, []);
 
-        return <Component route={preloadingRoute} {...rest} />;
+        // const getChildren = () => {
+        //     if (preloadingRoute.preloadingState.loading) {
+        //         return null;
+        //     }
+
+        //     if (!next) {
+        //         return null;
+        //     }
+
+        //     const Next = next;
+        //     return <Next />;
+        // };
+
+        // if (route.component) {
+        //     return <route.component route={preloadingRoute}>{getChildren()}</route.component>;
+        // }
+
+        // return getChildren();
+
+        if (route.component) {
+            console.log('Component preloading state is', preloadingRoute.preloadingState);
+            return (
+                <route.component route={preloadingRoute}>
+                    {preloadingRoute.preloadingState.loading ? null : children}
+                </route.component>
+            );
+        }
+
+        return children;
     });
 
 export const Link = ({
     to,
-    onClick,
+    onClick = () => null,
     children = null,
     ...rest
 }: {
     to: string;
-    children: React.ReactNode;
+    children?: React.ReactNode;
     onClick?: (event: any) => void;
 }) => {
     const [_, setLocation] = useLocation();
