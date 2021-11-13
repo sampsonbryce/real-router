@@ -1,6 +1,7 @@
 import React, {
     createContext,
     memo,
+    ReactNode,
     useCallback,
     useContext,
     useEffect,
@@ -18,15 +19,25 @@ type RequireAtLeastOne<T, Keys extends keyof T = keyof T> = Pick<T, Exclude<keyo
         [K in Keys]-?: Required<Pick<T, K>> & Partial<Pick<T, Exclude<Keys, K>>>;
     }[Keys];
 
+// The params parsed from the path matcher for a route. Ie the params from the variable/wildcard
+// parts of a routes `match` attribute.
 export type MatchParams = Record<string, string> | null;
 
+// Our own internal location to keep things simple
 export interface RouterLocation {
     pathname: string;
     search: string;
 }
 
+// The params needed by the useLocation setter func
+interface LocationSetterParams {
+    pathname?: string;
+    search?: Record<string, any> | string;
+}
+// The location setter function
 export type LocationChanger = (params: LocationSetterParams) => void;
 
+// Guards
 export type Guards = ArrayGuards;
 type ArrayGuards = Guard[];
 export type Guard = (params: GuardParams) => Promise<any>;
@@ -36,6 +47,7 @@ export interface GuardParams {
     location: RouterLocation;
 }
 
+// Resolvers
 export type Resolvers = ArrayResolvers;
 type ArrayResolvers = ObjectResolvers[];
 type ObjectResolvers = Record<string, any>;
@@ -46,52 +58,80 @@ export interface ResolverParams {
     location: RouterLocation;
 }
 
+// Route structure
 type ComponentOrChildren = RequireAtLeastOne<{
     component: React.ComponentType<any>;
-    children: Routes;
+    children: Route[];
 }>;
-export type Routes = Route[];
-export type Route = {
+export type RouteWithoutIds = {
     match: string;
     resolvers?: Resolvers;
     guards?: Guards;
 } & ComponentOrChildren;
 
-type InternalRoute = {
+type RouteWithIds = {
     id: string;
-    children?: InternalRoute[];
-} & Route;
+    children?: RouteWithIds[];
+} & RouteWithoutIds;
+export type Route = RouteWithIds | RouteWithoutIds;
 
-type FlatRoutes = FlatRoute[];
-type FlatRoute = {
-    match: string;
-    // component: React.ComponentType<any>;
-    hierarchy: Route[];
-};
-
-type RouterLocationStateSetter = (stateBuilder: (state: RouterLocation) => RouterLocation) => void;
-
+//
+// The router state. Should always be in sync with the url
 interface RouterState {
-    routes: InternalRoute[];
-    // flatRoutes: FlatRoutes;
+    routes: RouteWithIds[];
     location: RouterLocation;
     currentMatch: { hierarchy: string[]; params: MatchParams | null };
     hierarchyMap: HierarchyMap;
-    // currentFlatRouteState: { route: FlatRoute | null; params: MatchParams | null };
+    routeStates: Record<string, RouteState>;
 }
 
-interface LocationSetterParams {
-    pathname?: string;
-    search?: Record<string, any> | string;
-}
-
+// A mapping of path matchers (ie /profile/{id}/settings) to
+// a list of route ids that represent the routes to render
+// for a given path
 type HierarchyMap = Record<string, string[]>;
 
-const RouterContext = createContext<[RouterState | null, RouterLocationStateSetter | null]>([
-    null,
-    null,
-]);
+// Route state that tracks a routes guarding and resolving status
+export type RouteState = {
+    loading: boolean;
+    resolvedData: Record<string, any>;
+    completed: boolean;
+};
 
+// The props passed to each route component. Ie the `component` property on each Route
+// will get these.
+export type RouteComponentProps = {
+    route: RouteWithIds;
+    routeState: RouteState;
+    children?: ReactNode;
+};
+
+const RouterContext = createContext<
+    [RouterState | null, React.Dispatch<React.SetStateAction<RouterState>> | null]
+>([null, null]);
+
+// HELPERS
+
+const cancellablePromise = (promise: Promise<any>) => {
+    let isCancelled = false;
+
+    const wrappedPromise = new Promise((resolve, reject) => {
+        promise
+            .then((...args) => !isCancelled && resolve(...args))
+            .catch((error) => !isCancelled && reject(error));
+    });
+
+    return {
+        promise: wrappedPromise,
+        cancel() {
+            isCancelled = true;
+        },
+    };
+};
+
+/**
+ * Allows you to merge two paths without thinking
+ * to hard about leading/trailing slashes
+ */
 const mergePaths = (left: string, right: string) => {
     const leftSlash = left.charAt(left.length - 1) === '/';
     const rightSlash = right.charAt(0) === '/';
@@ -105,30 +145,10 @@ const mergePaths = (left: string, right: string) => {
     return `${left}/${right}`;
 };
 
-const match = (
-    path: string,
-    routes: FlatRoutes
-): { route: FlatRoute | null; params: MatchParams | null } => {
-    for (const route of routes) {
-        const { match } = route;
-
-        if (typeof match === 'string') {
-            if (match === '*') {
-                return { route, params: null };
-            }
-
-            const [regexMatch, params] = matchesRegex(path, match);
-            if (regexMatch) {
-                return { route, params };
-            }
-        }
-    }
-
-    console.error('No route found');
-
-    return { route: null, params: null };
-};
-
+/**
+ * Given a path, grab the associated hierarchy from
+ * the hierarchy map
+ */
 const matchHierarchy = (
     path: string,
     hierarchyMap: HierarchyMap
@@ -146,11 +166,15 @@ const matchHierarchy = (
         }
     }
 
+    // eslint-disable-next-line
     console.error('No route found');
 
     return { hierarchy: [], params: null };
 };
 
+/**
+ * Whether or not a route needs to go through preloading (guarding/resolving)
+ */
 const needsPreloading = (route: Route): boolean => {
     const hasGuards = route.guards && route.guards.length > 0;
     const hasResolvers = route.resolvers && route.resolvers.length > 0;
@@ -158,7 +182,10 @@ const needsPreloading = (route: Route): boolean => {
     return Boolean(hasGuards || hasResolvers);
 };
 
-const buildHierarchyMap = (routes: InternalRoute[]): HierarchyMap => {
+/**
+ * Builds the hierarchy map from the routes object
+ */
+const buildHierarchyMap = (routes: RouteWithIds[]): HierarchyMap => {
     const map: HierarchyMap = {};
     for (const route of routes) {
         if (route.children) {
@@ -175,51 +202,10 @@ const buildHierarchyMap = (routes: InternalRoute[]): HierarchyMap => {
     return map;
 };
 
-const flatten = (routes: Routes): FlatRoutes => {
-    const flatRoutes: FlatRoutes = [];
-
-    for (const route of routes) {
-        const flatRoute = { component: route.component, match: route.match, hierarchy: [route] };
-
-        if (route.children) {
-            const children = flatten(route.children);
-
-            for (const child of children) {
-                // const Component = flatRoute.component;
-                // const ChildComponent = child.component;
-
-                // let NewComponent: React.ComponentType<any> = Component
-                //     ? (props: any) => (
-                //           <Component {...props}>
-                //               <ChildComponent />
-                //           </Component>
-                //       )
-                //     : () => <ChildComponent />;
-
-                // if (needsPreloading(route)){
-                //     NewComponent = withRoutePreloader({ route, component: NewComponent })
-                // }
-
-                flatRoutes.push({
-                    match: mergePaths(flatRoute.match, child.match),
-                    // component: NewComponent,
-                    hierarchy: [...flatRoute.hierarchy, ...child.hierarchy],
-                });
-            }
-        } else if (route.component) {
-            // if (needsPreloading(route)){
-            //     flatRoutes.push({ ...flatRoute, component: withRoutePreloader({ route, component: route.component }) })
-            // } else {
-            flatRoutes.push(flatRoute as FlatRoute);
-            // }
-        } else {
-            console.error('Found route with no component or children properties. Ignoring');
-        }
-    }
-
-    return flatRoutes;
-};
-
+/**
+ * Checks if a path matches a path matcher and returns the
+ * url params if the path matches
+ */
 const matchesRegex = (path: string, matchPath: string): [boolean, MatchParams] => {
     const keys: any[] = [];
 
@@ -232,6 +218,7 @@ const matchesRegex = (path: string, matchPath: string): [boolean, MatchParams] =
     }
 
     const params = keys.reduce((p, key, i) => {
+        // eslint-disable-next-line
         p[key.name] = regexResult[i + 1];
         return p;
     }, {});
@@ -239,26 +226,60 @@ const matchesRegex = (path: string, matchPath: string): [boolean, MatchParams] =
     return [true, params];
 };
 
+/**
+ * Converts a location into a clean routerState object
+ *
+ * This function is expensive and should only be called when necessary
+ */
 const routerStateFromLocation = (
-    routes: InternalRoute[],
-    location: RouterLocation
+    routes: RouteWithIds[],
+    location: RouterLocation,
+    previous?: RouterState
 ): RouterState => {
-    // const flatRoutes = flatten(routes);
     const hierarchyMap = buildHierarchyMap(routes);
+    const currentMatch = matchHierarchy(location.pathname, hierarchyMap);
+
+    // Copy routeStates if the route still exists
+    // in the hierarchy
+    const routeStates: Record<string, RouteState> = {};
+    Object.entries(previous?.routeStates || {}).forEach(([id, state]) => {
+        if (currentMatch.hierarchy.includes(id)) {
+            routeStates[id] = state;
+        }
+    });
+
+    // Init new routeStates
+    mapHierarchyToRoutes(currentMatch.hierarchy, routes).forEach((route) => {
+        if (!(route.id in routeStates)) {
+            routeStates[route.id] = {
+                loading: needsPreloading(route),
+                resolvedData: {},
+                completed: false,
+            };
+        }
+    });
+
     return {
         routes,
         location,
-        currentMatch: matchHierarchy(location.pathname, hierarchyMap),
+        currentMatch,
         hierarchyMap,
-        // flatRoutes,
-        // currentFlatRouteState: match(location.pathname, flatRoutes),
+        routeStates,
     };
 };
-const getRouterLocationFromLocation = (location: Location) => ({
+
+/**
+ * Converts a location into a RouerLocation
+ */
+const getRouterLocationFromLocation = (location: Location): RouterLocation => ({
     pathname: location.pathname,
     search: location.search,
 });
 
+/**
+ * Helper method to great a search string
+ * from an object
+ */
 const buildSearchString = (search: string | Record<string, any>) => {
     let newSearch;
     if (typeof search === 'string') {
@@ -274,25 +295,178 @@ const buildSearchString = (search: string | Record<string, any>) => {
     return newSearch;
 };
 
+const addIdsToRoutes = (routes: Route[]): RouteWithIds[] => {
+    const newRoutes: RouteWithIds[] = routes.map((route) => {
+        if (route.children) {
+            return {
+                ...route,
+                children: addIdsToRoutes(route.children),
+                id: 'id' in route ? route.id : nanoid(),
+            };
+        }
+
+        return {
+            ...(route as RouteWithIds), // stupid ts
+            id: 'id' in route ? route.id : nanoid(),
+        };
+    });
+
+    return newRoutes;
+};
+
+const mapHierarchyToRoutes = (hierarchy: string[], routes: RouteWithIds[]): RouteWithIds[] => {
+    let routeList: RouteWithIds[] = [];
+    const currentHierarchy = [...hierarchy];
+    const id = currentHierarchy.shift();
+
+    for (const route of routes) {
+        if (route.id === id) {
+            routeList.push(route);
+
+            if (route.children && currentHierarchy.length === 0) {
+                throw new Error(
+                    `Hierachy does not match routes object. Found route ${route.id} with children and no hierarchy`
+                );
+            } else if (!route.children && currentHierarchy.length > 0) {
+                throw new Error(
+                    `Hierachy does not match routes object. Found route ${route.id} with no children and hierarchy ${currentHierarchy}`
+                );
+            } else if (route.children) {
+                const childRoutes = mapHierarchyToRoutes(currentHierarchy, route.children);
+                routeList = routeList.concat(childRoutes);
+            }
+        }
+    }
+
+    return routeList;
+};
+
+const preloadRoute = (
+    route: Route,
+    location: RouterLocation,
+    redirect: LocationChanger,
+    setRouteState: (state: RouteState) => void
+) => {
+    const guardPromise = (route.guards || []).reduce(
+        (prom, guard) => prom.then(() => guard({ route, redirect, location })),
+        Promise.resolve()
+    );
+
+    const resolvePromise = (route.resolvers || []).reduce((prom, resolverObject) => {
+        const resolvedData: Record<string, any> = {};
+        const resolvePromises = Object.entries(resolverObject).map(([key, resolver]) =>
+            resolver({ route, redirect, location }).then((result: any) => {
+                resolvedData[key] = result;
+            })
+        );
+
+        return Promise.all(resolvePromises).then(() => resolvedData);
+    }, Promise.resolve());
+
+    const preloadPromise = guardPromise.then(() => resolvePromise);
+
+    preloadPromise.then((resolvedData) => {
+        setRouteState({ loading: false, resolvedData, completed: true });
+    });
+
+    return cancellablePromise(preloadPromise);
+};
+
+export const preloadPath = async (
+    routes: Route[],
+    location: RouterLocation,
+    redirect: LocationChanger
+) => {
+    const routesWithIds = addIdsToRoutes(routes);
+
+    const routerState = routerStateFromLocation(routesWithIds, location);
+
+    const { hierarchy } = routerState.currentMatch;
+
+    const routeList = mapHierarchyToRoutes(hierarchy, routesWithIds);
+
+    let redirected = false;
+    const wrappedRedirect: LocationChanger = (params) => {
+        redirected = true;
+        return redirect(params);
+    };
+
+    let preloadCancel;
+    for (const route of routeList) {
+        if (redirected) {
+            break;
+        }
+
+        const setRouteState = (state: RouteState) => {
+            routerState.routeStates[route.id] = state;
+        };
+
+        const { promise, cancel } = preloadRoute(route, location, wrappedRedirect, setRouteState);
+
+        preloadCancel = cancel;
+
+        // eslint-disable-next-line
+        await promise;
+    }
+
+    if (redirected) {
+        if (preloadCancel) preloadCancel();
+        return null;
+    }
+
+    return routerState;
+};
+
+// HOOKS
+
 const useComponentCache = (): Record<string, React.ComponentType<any>> => {
     const cache = useRef({});
     return cache.current;
 };
 
 const useRouterState = () => {
-    const [routerState, setRouterLocationState] = useContext(RouterContext);
+    const [routerState, setRouterState] = useContext(RouterContext);
 
-    if (!routerState || !setRouterLocationState) {
+    if (!routerState || !setRouterState) {
         throw new Error(
             'Invalid use of a router hook outside of the router context. Did put the <Router /> component at the root of your application?'
         );
     }
 
-    return [routerState, setRouterLocationState] as [RouterState, RouterLocationStateSetter];
+    return [routerState, setRouterState] as [typeof routerState, typeof setRouterState];
+};
+
+const useCurrentMatch = () => {
+    const [routerState] = useRouterState();
+
+    if (!routerState.currentMatch.hierarchy.length) {
+        throw new Error(
+            "Trying to access route when none has been found. Did you remember to have a '*' catch-all?"
+        );
+    }
+
+    return routerState.currentMatch;
+};
+
+export const useParams = () => {
+    const { params } = useCurrentMatch();
+
+    return params;
 };
 
 export const useLocation = (): [RouterLocation, LocationChanger] => {
-    const [routerState, setRouterLocationState] = useRouterState();
+    const [routerState, setRouterState] = useRouterState();
+
+    // Todo maybe not needed?
+    const setRouterLocationState = useCallback(
+        (stateBuilder: (state: RouterLocation) => RouterLocation) => {
+            setRouterState((oldState) => {
+                const newLocationState = stateBuilder(oldState.location);
+                return routerStateFromLocation(routerState.routes, newLocationState, oldState);
+            });
+        },
+        [routerState, setRouterState]
+    );
 
     const locationSetter = useCallback(({ pathname, search }: LocationSetterParams) => {
         const newState: Partial<RouterLocation> = {};
@@ -311,76 +485,18 @@ export const useLocation = (): [RouterLocation, LocationChanger] => {
         });
     }, []);
 
-    console.log('Location', routerState.location);
     return [routerState.location, locationSetter];
 };
 
-// const useCurrentFlatRoute = () => {
-//     const [routerState] = useRouterState();
+const useLocationSync = () => {
+    const [routerState, setRouterLocation] = useRouterState();
+    const { routes } = routerState;
 
-//     return routerState.currentFlatRouteState;
-// };
-
-// export const useCurrentRoute = () => {
-//     const { route: flatRoute, params } = useCurrentFlatRoute();
-
-//     if (!flatRoute) {
-//         throw new Error(
-//             "Trying to access route when none has been found. Did you remember to have a '*' catch-all?"
-//         );
-//     }
-
-//     return { route: flatRoute.hierarchy[flatRoute.hierarchy.length - 1], params };
-// };
-
-const addIdsToRoutes = (routes: Route[]): InternalRoute[] => {
-    const newRoutes: InternalRoute[] = routes.map((route) => {
-        if (route.children) {
-            return {
-                ...route,
-                children: addIdsToRoutes(route.children),
-                id: nanoid(),
-            };
-        }
-
-        return {
-            ...(route as InternalRoute), // stupid ts
-            id: nanoid(),
-        };
-    });
-
-    return newRoutes;
-};
-
-const useCurrentMatch = () => {
-    const [routerState] = useRouterState();
-
-    return routerState.currentMatch;
-};
-
-export const Router = memo(({ routes: nonStaticRoutes }: { routes: Routes }) => {
-    // Make routes static
-    const routes = useMemo(() => nonStaticRoutes, []);
-
-    const routesWithIds = useMemo(() => addIdsToRoutes(routes), [routes]);
-
-    const [routerState, setRouterState] = useState<RouterState>(() =>
-        routerStateFromLocation(routesWithIds, getRouterLocationFromLocation(location))
-    );
-
-    const setRouterLocationState = useCallback(
-        (stateBuilder: (state: RouterLocation) => RouterLocation) => {
-            setRouterState((oldState) => {
-                const newLocationState = stateBuilder(oldState.location);
-                return routerStateFromLocation(routesWithIds, newLocationState);
-            });
-        },
-        [setRouterState, routesWithIds]
-    );
-
-    console.log('Router State:', routerState);
-
-    // Sync location to url
+    // This useEffect syncs the routerStates location to the
+    // browser history and url. This will only be run
+    // from navigation via the useLocation hooks setter
+    // as other regular browser navigation (back button) will be picked
+    // up by the pop state listener
     useEffect(() => {
         if (
             location.pathname === routerState.location.pathname &&
@@ -396,12 +512,20 @@ export const Router = memo(({ routes: nonStaticRoutes }: { routes: Routes }) => 
         );
     }, [routerState.location]);
 
+    // This listener will be called whenever the window popstate
+    // event occurs (ie when the user hits the back button).
+    // It updates the router state from the new location
     const popStateListener = useCallback(() => {
-        setRouterState(routerStateFromLocation(routesWithIds, location));
-    }, [routes, setRouterState]);
+        setRouterLocation((oldState) => ({
+            ...oldState,
+            ...getRouterLocationFromLocation(location),
+        }));
+    }, [routes, setRouterLocation]);
 
+    // This ref and useEffect will keep the correct popStateListener
+    // actively subscribed to the window popstate event
+    // so that we can properly handle the back button
     const previousPopstateListener = useRef(popStateListener);
-
     useEffect(() => {
         // Skip remove on initial render
         if (previousPopstateListener.current !== popStateListener) {
@@ -410,76 +534,41 @@ export const Router = memo(({ routes: nonStaticRoutes }: { routes: Routes }) => 
         window.addEventListener('popstate', popStateListener);
         previousPopstateListener.current = popStateListener;
     }, [popStateListener]);
-
-    return (
-        <RouterContext.Provider value={[routerState, setRouterLocationState]}>
-            <RouterConsumer />
-        </RouterContext.Provider>
-    );
-});
-
-const RouterConsumer = memo(() => {
-    // const { route } = useCurrentFlatRoute();
-    const { hierarchy } = useCurrentMatch();
-
-    if (!hierarchy.length) {
-        console.error(
-            "Trying to access route when none has been found. Did you remember to have a '*' catch-all?"
-        );
-
-        return null;
-    }
-
-    return <RenderHierarchy />;
-});
-
-const getRouteListFromHierarchy = (
-    hierarchy: string[],
-    routes: InternalRoute[]
-): InternalRoute[] => {
-    let routeList: InternalRoute[] = [];
-    const currentHierarchy = [...hierarchy];
-    const id = currentHierarchy.shift();
-    console.log('RouteList from hierarchy', id, routes);
-
-    for (const route of routes) {
-        if (route.id === id) {
-            routeList.push(route);
-
-            if (route.children && currentHierarchy.length === 0) {
-                throw new Error(
-                    `Hierachy does not match routes object. Found route ${route.id} with children and no hierarchy`
-                );
-            } else if (!route.children && currentHierarchy.length > 0) {
-                throw new Error(
-                    `Hierachy does not match routes object. Found route ${route.id} with no children and hierarchy ${currentHierarchy}`
-                );
-            } else if (route.children) {
-                const childRoutes = getRouteListFromHierarchy(currentHierarchy, route.children);
-                routeList = routeList.concat(childRoutes);
-            }
-        }
-    }
-
-    return routeList;
 };
 
-const RenderHierarchy = () => {
+/**
+ * This hooks differs from the useRouterState hook in
+ * that it sets up the router state such that this hooks return value
+ * can be passed directly to the RouterContext.Provider.
+ * This hook should only be used once in the Router component,
+ * useRouterState should be used everywhere else to read the router state
+ *
+ */
+const useInitialRouterState = (routes: RouteWithoutIds[], initial?: RouterState) => {
+    const routesWithIds = useMemo(() => addIdsToRoutes(routes), [routes]);
+
+    const [routerState, setRouterState] = useState<RouterState>(() => {
+        if (initial) return initial;
+
+        return routerStateFromLocation(routesWithIds, getRouterLocationFromLocation(location));
+    });
+
+    return [routerState, setRouterState] as [typeof routerState, typeof setRouterState];
+};
+
+/**
+ * This hook takes the hierarchy of
+ * routes that should be rendered and converts it
+ * into a list of components that should be rendered
+ */
+const useCurrentMatchComponents = () => {
     const [routerState] = useRouterState();
+    const { hierarchy } = useCurrentMatch();
     const componentCache = useComponentCache();
 
     const { routes } = routerState;
-    const { hierarchy } = routerState.currentMatch;
 
-    console.log('Hierarchy', hierarchy);
-    console.log('ComponentCache', componentCache);
-
-    const routeList = useMemo(
-        () => getRouteListFromHierarchy(hierarchy, routes),
-        [hierarchy, routes]
-    );
-
-    console.log('RouteList', routeList);
+    const routeList = useMemo(() => mapHierarchyToRoutes(hierarchy, routes), [hierarchy, routes]);
 
     const components = useMemo(() => {
         for (const id of Object.keys(componentCache)) {
@@ -490,11 +579,9 @@ const RenderHierarchy = () => {
 
         const componentsList = routeList.map((route) => {
             if (route.id in componentCache) {
-                console.log('Using cached component for route', route.id);
                 return componentCache[route.id];
             }
 
-            console.log('Using new component for route', route.id);
             const component = withRoutePreloader(route);
             component.displayName = route.id;
             componentCache[route.id] = component;
@@ -505,24 +592,109 @@ const RenderHierarchy = () => {
         return componentsList;
     }, [routeList, componentCache, hierarchy]);
 
-    console.log('Components', components);
+    return components;
+};
 
-    // const route = useMemo(() => hierarchy[0], [hierarchy]);
-    // const newHierarchy = useMemo(() => hierarchy.slice(1), [hierarchy]);
+export const useRouteState = (route: RouteWithIds) => {
+    const [routerState, setRouterState] = useRouterState();
+    const { routeStates } = routerState;
 
-    // const next = useMemo(() => {
-    //     if (newHierarchy.length > 0) {
-    //         return (props: any) => <RenderHierarchy hierarchy={newHierarchy} {...props} />;
-    //     }
+    const setRouteState = useCallback(
+        (state: RouteState) => {
+            setRouterState((old) => ({
+                ...old,
+                routeStates: {
+                    ...old.routeStates,
+                    [route.id]: state,
+                },
+            }));
+        },
+        [setRouterState, route]
+    );
 
-    //     return null;
-    // }, [newHierarchy]);
+    if (route.id in routeStates) {
+        // type ResolverType = typeof route.resolvers;
+        // type ResolverItems = ResolverType extends Iterable<Promise<infer X>> ? X : never;
+        const routeState = routeStates[route.id];
+        return [routeState, setRouteState] as [
+            // RouteState<ResolvedData<typeof route.resolvers>>,
+            typeof routeState,
+            typeof setRouteState
+        ];
+    }
 
-    // console.log('RENDER HIERARCHY FOR ROUTE', route, hierarchy, newHierarchy);
+    throw new Error(`Attempt to access uninitialized routeState. Route ${route.id}`);
+};
 
-    // const Component = useMemo(() => withRoutePreloader({ route, next }), [route, next]);
+// const resolvers = [Promise.resolve({ a: 'green' }), Promise.resolve({ b: 1 })];
+// type ResolverType = typeof resolvers;
+// type ResolverItems = ResolverType extends Iterable<Promise<infer X>> ? X : never;
 
-    // return <Component {...rest} />;
+// Black magic https://stackoverflow.com/questions/50374908/transform-union-type-to-intersection-type
+// type UnionToIntersection<U> = (U extends any ? (k: U) => void : never) extends (k: infer I) => void
+//     ? I
+//     : never;
+// type ResolvedObject = ResolverItems extends infer O ? { [K in keyof O]: O[K] } : never;
+// type ResolvedObject = UnionToIntersection<ResolverItems>;
+
+// type ResolvedData<RT> = RT extends Iterable<Promise<Record<string, any>>>
+//     ? UnionToIntersection<RT extends Iterable<Promise<infer X>> ? X : {}>
+//     : {};
+
+const useRoutePreload = (route: RouteWithIds) => {
+    const [locationState, setLocationState] = useLocation();
+    const [routeState, setRouteState] = useRouteState(route);
+
+    useEffect(() => {
+        if (routeState.completed) {
+            return () => null;
+        }
+
+        const { cancel } = preloadRoute(route, locationState, setLocationState, setRouteState);
+
+        // Cancel preload promises if the component is unmounted
+        return () => {
+            cancel();
+        };
+    }, []);
+};
+
+// ROUTER
+
+export const Router = memo(
+    ({
+        routes: nonStaticRoutes,
+        initialRouterState,
+    }: {
+        routes: Route[];
+        initialRouterState?: RouterState;
+    }) => {
+        // Make routes static. Routes should not be dynamic
+        const routes = useMemo(() => nonStaticRoutes, []);
+
+        const [routerState, setRouterLocationState] = useInitialRouterState(
+            routes,
+            initialRouterState
+        );
+
+        return (
+            <RouterContext.Provider value={[routerState, setRouterLocationState]}>
+                <RouterConsumer />
+            </RouterContext.Provider>
+        );
+    }
+);
+
+/**
+ * The consumer is separate from the Router
+ * as it consumes the router context instead of providing
+ * the context. So the main reason for this component
+ * is that we can just call useRouterState
+ */
+const RouterConsumer = memo(() => {
+    useLocationSync();
+
+    const components = useCurrentMatchComponents();
 
     let componentToRender = null;
     for (const Component of components) {
@@ -530,89 +702,25 @@ const RenderHierarchy = () => {
     }
 
     return componentToRender;
-};
+});
 
-export type PreloadingRoute = Route & {
-    preloadingState: { loading: boolean; resolvedData: Record<string, any> };
-};
-
-const withRoutePreloader = (route: InternalRoute) =>
+/**
+ * This HOC handles the guarding and resolving of routes,
+ * as well as defining and updating the routeState based
+ * on the guarding and resolving status
+ */
+const withRoutePreloader = (route: RouteWithIds) =>
     memo(({ children }: { children: any }) => {
-        const [preloadingState, setPreloadingState] = useState(() => ({
-            loading: needsPreloading(route),
-            resolvedData: {},
-        }));
-        const [locationState, setLocationState] = useLocation();
-
-        const preloadingRoute: PreloadingRoute = useMemo(
-            () => ({
-                ...route,
-                preloadingState,
-            }),
-            [preloadingState]
-        );
-
-        useEffect(() => {
-            const guardPromise = (route.guards || []).reduce(
-                (prom, guard) =>
-                    prom.then(() =>
-                        guard({ route, redirect: setLocationState, location: locationState })
-                    ),
-                Promise.resolve()
-            );
-
-            const resolvePromise = (route.resolvers || []).reduce((prom, resolverObject) => {
-                const resolvedData: Record<string, any> = {};
-                const resolvePromises = Object.entries(resolverObject).map(([key, resolver]) =>
-                    resolver({ route, redirect: setLocationState, location: locationState }).then(
-                        (result: any) => {
-                            resolvedData[key] = result;
-                        }
-                    )
-                );
-
-                return Promise.all(resolvePromises).then(() => resolvedData);
-            }, Promise.resolve());
-
-            const preloadPromise = guardPromise.then(() => resolvePromise);
-
-            preloadPromise.then((resolvedData) =>
-                setPreloadingState({ loading: false, resolvedData })
-            );
-
-            // TODO return function to cancel promise chain
-        }, []);
-
-        // const getChildren = () => {
-        //     if (preloadingRoute.preloadingState.loading) {
-        //         return null;
-        //     }
-
-        //     if (!next) {
-        //         return null;
-        //     }
-
-        //     const Next = next;
-        //     return <Next />;
-        // };
-
-        // if (route.component) {
-        //     return <route.component route={preloadingRoute}>{getChildren()}</route.component>;
-        // }
-
-        // return getChildren();
+        useRoutePreload(route);
 
         if (route.component) {
-            console.log('Component preloading state is', preloadingRoute.preloadingState);
-            return (
-                <route.component route={preloadingRoute}>
-                    {preloadingRoute.preloadingState.loading ? null : children}
-                </route.component>
-            );
+            return <route.component route={route}>{children}</route.component>;
         }
 
         return children;
     });
+
+// LINK
 
 export const Link = ({
     to,
@@ -655,5 +763,3 @@ export const Link = ({
         </a>
     );
 };
-
-// TODO: Routes rerunning all guards/resovlers on leaf change
